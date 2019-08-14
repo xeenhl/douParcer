@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"errors"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -21,9 +23,124 @@ type Comment struct {
 
 type matcher func(val1, val2 string) bool
 
+var endings = [4]string{",", ".", "?", "!"}
+var tokens = make(map[string]int)
+var mode = flag.String("mode", "validate", "help message for flagname")
+
+const (
+	sp           = "&"
+	validateMode = "validate"
+	teachMode    = "teach"
+)
+
 func main() {
-	//resp, err := http.Get("https://dou.ua/forums/topic/27292/")
-	resp, err := http.Get("https://dou.ua/forums/topic/28029/")
+	flag.Parse()
+	uploadTokens(tokens, "out.tokens")
+	fmt.Println("Upladed tokens: ", len(tokens))
+
+	//"https://dou.ua/forums/topic/27292/"
+	comentaries := populateComentaries("https://dou.ua/forums/topic/28061/")
+	fmt.Println("Comentaries found: ", len(comentaries))
+
+	if *mode == validateMode {
+		toxComsC := 0
+		comentaries = validateCometraries(comentaries)
+		for _, com := range comentaries {
+			if com.ToxicRate > 0 {
+				fmt.Println(com)
+				toxComsC++
+			}
+		}
+		fmt.Printf("Found %v toxic comments\n", toxComsC)
+	}
+
+	if *mode == teachMode {
+		teachModel(comentaries)
+	}
+
+	saveComentsTokensToFile(comentaries, "out.tokens")
+
+}
+
+func validateCometraries(comentaries []Comment) []Comment {
+	fmt.Println("In validation mode")
+	calulated := make([]Comment, 0, 0)
+	for _, com := range comentaries {
+		com.ToxicRate = calculateToxic(com.Tokens, com.ReplyDepth)
+		calulated = append(calulated, com)
+	}
+	return calulated
+}
+
+func calculateToxic(toks []string, depth int) int {
+	toxrate := depth
+	for _, tok := range toks {
+		if toxr, ok := tokens[tok]; ok {
+			toxrate += toxr
+		}
+	}
+	return toxrate
+}
+
+func teachModel(comentaries []Comment) {
+	fmt.Println("In teaching mode")
+
+	reader := bufio.NewReader(os.Stdin)
+	for _, comment := range comentaries {
+
+		fmt.Println(comment)
+		fmt.Print("Is this commentary count as toxic (true/false): ")
+		eval, _ := reader.ReadString('\n')
+		eval = strings.Trim(eval, " \r\n")
+		toxic, err := strconv.ParseBool(eval)
+		if err != nil {
+			toxic = false
+		}
+		updateTokensToxic(comment.Tokens, toxic)
+	}
+
+}
+
+func uploadTokens(tokens map[string]int, file string) {
+	f, err := os.OpenFile(file, os.O_RDONLY, 0644)
+
+	if err != nil {
+		panic(err)
+	}
+
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		tok, tox, err := getTokenToxic(scanner.Text())
+		if err == nil {
+			tokens[tok] = tox
+		}
+	}
+}
+
+func getTokenToxic(rawToken string) (string, int, error) {
+	data := strings.Split(rawToken, sp)
+	if len(data) == 1 {
+		return data[0], 0, nil
+	}
+
+	if len(data) == 2 {
+		tox, err := strconv.ParseInt(data[1], 10, 64)
+
+		if err != nil {
+			return "", 0, err
+		}
+
+		return data[0], int(tox), nil
+	}
+
+	return "", 0, errors.New(fmt.Sprintf("Cant process tpoken: %v", rawToken))
+}
+
+func populateComentaries(url string) []Comment {
+
+	resp, err := http.Get(url)
 
 	if err != nil {
 		panic(err)
@@ -46,11 +163,18 @@ func main() {
 	comList := findByAttribute(n, "id", "commentsList")
 	comms := findAllByAttributeMathcer(comList, "class", "b-comment", contains)
 
-	comentaries := parceToComentaries(comms)
-	fmt.Println("Comentaries found: ", len(comentaries))
+	return parceToComentaries(comms)
+}
 
-	saveComentsTokensToFile(comentaries)
-
+func updateTokensToxic(toks []string, increase bool) {
+	for _, tok := range toks {
+		if increase {
+			tokens[tok] += 1
+		}
+		if !increase {
+			tokens[tok] -= 1
+		}
+	}
 }
 
 func findByAttribute(root *html.Node, attribute, value string) *html.Node {
@@ -129,21 +253,20 @@ func getReplyDepFromNode(node *html.Node) int {
 	return v
 }
 
-func uniqeTokens(tokens []string, m map[string]bool) []string {
-	u := make([]string, 0, 0)
-
+func addUniqeTokens(tokens []string, tokensMap map[string]int) int {
+	newToc := 0
 	for _, val := range tokens {
-		if _, ok := m[val]; !ok {
-			m[val] = true
-			u = append(u, val)
+		val = removeEndings(val)
+		if _, ok := tokensMap[val]; !ok {
+			tokensMap[val] = 0
+			newToc++
 		}
 	}
-
-	return u
+	return newToc
 }
 
-func saveComentsTokensToFile(comentaries []Comment) {
-	f, err := os.OpenFile("out.tokens", os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
+func saveComentsTokensToFile(comentaries []Comment, file string) {
+	f, err := os.OpenFile(file, os.O_APPEND|os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
 
 	if err != nil {
 		panic(err)
@@ -156,22 +279,28 @@ func saveComentsTokensToFile(comentaries []Comment) {
 		t = append(t, c.Tokens...)
 	}
 
-	m := make(map[string]bool)
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		m[scanner.Text()] = true
-	}
+	newTokens := addUniqeTokens(t, tokens)
 
-	out := uniqeTokens(t, m)
+	f.Truncate(0)
+	f.Seek(0, 0)
 
-	for _, tok := range out {
-		_, err := f.WriteString(tok + "\n")
+	for tok, tox := range tokens {
+		_, err := f.WriteString(tok + sp + strconv.Itoa(tox) + "\n")
 		if err != nil {
 			panic(err)
 		}
 	}
 
-	fmt.Println("Saved new uniqe tokens: ", len(out))
+	fmt.Println("Saved new uniqe tokens: ", newTokens)
+}
+
+func removeEndings(token string) string {
+	for _, ending := range endings {
+		if strings.HasSuffix(token, ending) {
+			return token[:len(token)-1]
+		}
+	}
+	return token
 }
 
 func contains(sourse, match string) bool {
